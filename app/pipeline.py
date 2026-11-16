@@ -24,6 +24,7 @@ from .deidentify import (
     read_and_validate,
     sha256_bytes,
 )
+from .references import extract_referenced_sop_uids
 from .store import Store
 
 log = logging.getLogger("deid.pipeline")
@@ -72,8 +73,10 @@ def process_package(store: Store, package_id: str) -> None:
                 ds = read_and_validate(data, m.filename)
                 entries.append((m.filename, data, ds))
 
-        # 2) 包内 SOPInstanceUID 不得重复
+        # 2) 包内 SOPInstanceUID 不得重复；同时提取各层序列引用关系（处理前提取，
+        #    保留原始 UID，撤回闭包与发布闸门依赖这一关系）
         seen: dict[str, str] = {}
+        references: list[tuple[str, str]] = []
         for filename, _data, ds in entries:
             sop = str(ds.SOPInstanceUID)
             if sop in seen:
@@ -81,6 +84,8 @@ def process_package(store: Store, package_id: str) -> None:
                     f"包内 SOPInstanceUID {sop} 重复（{seen[sop]} 与 {filename}），整包拒收"
                 )
             seen[sop] = filename
+            for ref_uid, ref_path in extract_referenced_sop_uids(ds):
+                references.append((ref_uid, f"{filename}::{ref_path}"))
 
         # 3) 建立 UID 映射与引用校验集合
         uid_map: dict[str, str] = {}
@@ -89,7 +94,25 @@ def process_package(store: Store, package_id: str) -> None:
                 uid_map[u] = mapped_uid(project_id, u)
         published_uids = store.published_uids(project_id)
 
-        # 4) 去标识化 + 递归引用同步（引用缺失在此抛 RejectionError）
+        # 4) 快速预检：成员包含或序列引用已撤回实例 → 整包拒收
+        #    （发布事务内还有权威闸门，预检只为给出清晰原因并省去无谓处理）
+        withdrawn_uids = store.withdrawn_sop_uids(project_id)
+        if withdrawn_uids:
+            for _filename, _data, ds in entries:
+                member_uid = str(ds.SOPInstanceUID)
+                if member_uid in withdrawn_uids:
+                    raise RejectionError(
+                        f"包成员 SOPInstanceUID {member_uid} 属于已撤回实例，"
+                        "整包拒收（撤回实例不得重新进入研究）"
+                    )
+            for ref_uid, ref_path in references:
+                if ref_uid in withdrawn_uids:
+                    raise RejectionError(
+                        f"{ref_path} 引用的 SOPInstanceUID {ref_uid} 已撤回，"
+                        "整包拒收（引用已撤回实例的包不得发布）"
+                    )
+
+        # 5) 去标识化 + 递归引用同步（引用缺失在此抛 RejectionError）
         processed = []  # (映射后SOP UID, 处理后字节, 实例登记信息)
         for filename, data, ds in entries:
             original_uids = instance_uids(ds)  # 处理前的原始 UID
@@ -105,25 +128,36 @@ def process_package(store: Store, package_id: str) -> None:
                 "mapped_sop_uid": mapped_sop,
             }))
 
-        # 5) 写处理包到 staging，原子改名到 packages/
+        # 6) 写处理包到 staging，原子改名到 packages/
         with zipfile.ZipFile(staging_zip, "w", zipfile.ZIP_DEFLATED) as out:
             for mapped_sop, blob, _info in processed:
                 out.writestr(f"{mapped_sop}.dcm", blob)
         os.replace(staging_zip, final_zip)
 
-        # 6) 事务发布（冲突检查 + 实例登记 + 状态更新原子完成）
-        ok, conflict_uid = store.publish_package(
+        # 7) 事务发布（冲突/撤回闸门 + 实例与关系登记 + 状态更新原子完成）
+        result = store.publish_package(
             package_id, project_id, [info for _m, _b, info in processed],
-            f"packages/{package_id}.zip",
+            f"packages/{package_id}.zip", references,
         )
-        if not ok:
+        if not result["ok"]:
             final_zip.unlink(missing_ok=True)
-            store.set_status(
-                package_id, "rejected",
-                f"SOPInstanceUID {conflict_uid} 与本项目已发布实例同号但原文不同"
-                "（同实例异文），整包拒收",
-            )
-            log.warning("package %s rejected: conflict on %s", package_id, conflict_uid)
+            if result["kind"] == "conflict":
+                store.set_status(
+                    package_id, "rejected",
+                    f"SOPInstanceUID {result['uid']} 与本项目已发布实例同号但原文不同"
+                    "（同实例异文），整包拒收",
+                )
+                log.warning("package %s rejected: conflict on %s",
+                            package_id, result["uid"])
+            else:
+                where = "序列引用" if result.get("ref") else "包成员包含"
+                store.set_status(
+                    package_id, "rejected",
+                    f"{where}已撤回 SOPInstanceUID {result['uid']}，整包拒收"
+                    "（撤回实例不得重新进入研究）",
+                )
+                log.warning("package %s rejected: withdrawn uid %s",
+                            package_id, result["uid"])
             return
         log.info("package %s published (%d instances)", package_id, len(processed))
 

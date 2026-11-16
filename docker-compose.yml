@@ -1,5 +1,6 @@
 # 双实例部署：app1/app2 共享同一命名卷（原件、处理包、SQLite 目录库），
-# 演示并发上传、跨实例复用与跨批引用。宿主机分别通过 8001/8002 访问。
+# 演示并发上传、跨实例复用、跨批引用与项目内撤回（含连带闭包与上传/下载闸门）。
+# 宿主机分别通过 8001/8002 访问，浏览器可直接演示上传、撤回、下载。
 services:
   app1:
     build: .
@@ -9,6 +10,11 @@ services:
       - deid-data:/data
     ports:
       - "8001:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   app2:
     build: .
@@ -18,6 +24,11 @@ services:
       - deid-data:/data
     ports:
       - "8002:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 volumes:
   deid-data:

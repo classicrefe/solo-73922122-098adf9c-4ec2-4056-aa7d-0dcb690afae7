@@ -35,7 +35,8 @@ def make_dicom_bytes(
     series_uid=None,
     sop_uid=None,
     transfer_syntax=ExplicitVRLittleEndian,
-    refs=(),                # 引用的原始 SOPInstanceUID 列表
+    refs=(),                # 顶层 ReferencedImageSequence 引用的原始 SOPInstanceUID
+    nested_refs=(),         # 嵌套两层序列内的 ReferencedSOPInstanceUID
     burned_in="NO",
     number_of_frames=None,
     private_tag=True,
@@ -90,6 +91,18 @@ def make_dicom_bytes(
                 item.add_new(0x00111002, "LO", "SEQ-PRIVATE-SECRET")
             items.append(item)
         ds.ReferencedImageSequence = items
+    if nested_refs:
+        # 两层嵌套序列（ProcedureCodeSequence 仅作承载容器）：
+        # ProcedureCodeSequence[i].ReferencedStudySequence[j].ReferencedSOPInstanceUID
+        outer = Dataset()
+        inner_items = []
+        for r in nested_refs:
+            inner = Dataset()
+            inner.ReferencedSOPClassUID = CT_IMAGE_STORAGE
+            inner.ReferencedSOPInstanceUID = r
+            inner_items.append(inner)
+        outer.ReferencedStudySequence = inner_items
+        ds.ProcedureCodeSequence = [outer]
     buf = io.BytesIO()
     pydicom.dcmwrite(buf, ds, enforce_file_format=True)
     return buf.getvalue()
